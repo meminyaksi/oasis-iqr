@@ -133,7 +133,7 @@ export LD_LIBRARY_PATH=$HOME/opt/lib:$LD_LIBRARY_PATH
 ```
 
 Table functions: `iqr_flags(path, col)` (value + `is_outlier`), `iqr_flags_only(path, col)`,
-the CPU baselines `iqr_cpu_flags` / `iqr_cpu_flags_groupby`, and `iqr_profiler()` /
+the CPU baseline `iqr_cpu_flags_groupby` (exact quartiles), and `iqr_profiler()` /
 `decoder_profiler()`.
 
 The evaluated configuration enables the fused path, where pass 1 (the histogram) runs on chip during

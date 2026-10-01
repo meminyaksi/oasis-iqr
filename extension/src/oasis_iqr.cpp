@@ -1318,7 +1318,7 @@ void IqrFlagsFunction(ClientContext &, TableFunctionInput &data_p, DataChunk &ou
 }
 
 // Unpacks `emit` flags starting at element `start` out of a packed bitmask into a single BOOLEAN
-// output vector. Shared verbatim by iqr_flags_only (FPGA) and iqr_cpu_flags (CPU): both produce the
+// output vector. Shared verbatim by iqr_flags_only (FPGA) and iqr_cpu_flags_groupby (CPU): both produce the
 // same packed layout, so the entire output path of the two operators is the same code. That is what
 // makes the head-to-head a controlled experiment -- only the compute differs, never the emit.
 void EmitFlagSlice(const uint8_t *mask, size_t start, size_t emit, DataChunk &output) {
@@ -1350,7 +1350,7 @@ void IqrFlagsOnlyFunction(ClientContext &, TableFunctionInput &data_p, DataChunk
 }
 
 // =============================================================================================
-// iqr_cpu_flags(path VARCHAR, column VARCHAR) -- the CPU reference implementation
+// CPU reference implementation (iqr_cpu_flags_groupby, below) -- shared infrastructure
 //
 // The apples-to-apples twin of iqr_flags_only: same bind, same validation, same packed-bitmask
 // output, same emit code (EmitFlagSlice). The ONLY difference is that the quartiles and the fence
@@ -1368,12 +1368,7 @@ void IqrFlagsOnlyFunction(ClientContext &, TableFunctionInput &data_p, DataChunk
 //   q3 = smallest v with (#elements <= v)*4 >= 3N ==  the ceil(3N/4)-th smallest value
 //   d = q3-q1;  lo = q1 - (d + (d>>1));  hi = q3 + (d + (d>>1))   (1.5*IQR, divider-free)
 //   flag[i] = (v[i] < lo) || (v[i] > hi)
-// so the quartiles are plain order statistics. We resolve them with an iterative histogram zoom
-// rather than a sort: one parallel min/max pass, then parallel binned passes that narrow the range
-// holding each rank one level at a time (both quartiles advanced in the SAME pass) until a bin holds
-// a single distinct value, which is then exact. O(N) per level, at most a handful of levels (two for
-// every dataset here), no sort, no candidate materialization, bounded memory -- and the same shape as
-// the hardware's windowed histogram. See SelectQuartiles / AdvanceRankQueries below.
+// so the quartiles are plain order statistics, computed exactly by iqr_cpu_flags_groupby below.
 // =============================================================================================
 
 // OASIS_IQR_CPU_RAW_ALLOC=1 makes the CPU baseline allocate its materialised column with raw
@@ -1591,222 +1586,6 @@ void ParallelRanges(size_t n, size_t nthreads, F &&fn) {
     }
 }
 
-template <class T>
-void ParallelMinMax(const T *v, size_t n, size_t nt, T &out_min, T &out_max) {
-    // Unused slots keep the identity values, so the reductions below stay correct when
-    // ParallelRanges spawns fewer than `nt` threads.
-    std::vector<T> mins(nt, std::numeric_limits<T>::max());
-    std::vector<T> maxs(nt, std::numeric_limits<T>::lowest());
-    ParallelRanges(n, nt, [&](size_t t, size_t lo, size_t hi) {
-        T mn = std::numeric_limits<T>::max();
-        T mx = std::numeric_limits<T>::lowest();
-        for (size_t i = lo; i < hi; i++) {
-            T x = v[i];
-            mn  = x < mn ? x : mn;
-            mx  = x > mx ? x : mx;
-        }
-        mins[t] = mn;
-        maxs[t] = mx;
-    });
-    out_min = *std::min_element(mins.begin(), mins.end());
-    out_max = *std::max_element(maxs.begin(), maxs.end());
-}
-
-// 65536 bins x 8 B = 512 KB per table. This is a DELIBERATE configuration choice, not an oversight:
-// the 4096 x 4 B = 16 KB variant is faster (16 KB stays resident in L1 alongside the streaming column,
-// while 512 KB overflows L2 and makes every data-dependent increment a cache miss), and the cost of
-// the wider table is measured in RESULTS.md 9.26: quart is 1.28-2.59x slower across the seven
-// datasets (sf10 66.60 vs 36.76 ms; +19.3 ms from the bins, +8.5 ms from the counter width).
-// It is kept at 65536/uint64 by preference, so:
-//
-//   * DO NOT "fix" this back to 4096/uint32 as a performance cleanup without reading 9.26 first --
-//     the tradeoff is known and was chosen.
-//   * A slower CPU baseline flatters the FPGA. Whenever a speedup is quoted against this operator,
-//     9.26's delta has to be disclosed alongside it, or the comparison drifts back into exactly the
-//     class of unfairness 9.18 was written to remove.
-//
-// Correctness is unaffected either way: more bins means FEWER levels (65536 bins divide the range by
-// 2^16 per level, so <=4 levels for any 64-bit range vs <=6 at 4096), and both settings still resolve
-// every real column here in two. uint64 counters cannot overflow for any row count that fits in
-// memory (uint32 was already safe to 4.29e9 rows per thread).
-constexpr size_t IQR_CPU_HIST_BINS = 1u << 16;
-
-// Histogram counter type. uint64 doubles the table footprint versus uint32 (see above) and is kept by
-// preference; the merge loop widths below follow this typedef, so changing it here is sufficient.
-using IqrHistCount = uint64_t;
-
-// One "find the rank-th smallest value inside [lo,hi]" question, narrowed one histogram level at a
-// time. Several of these are advanced together so that q1 and q3 share a single pass over the column.
-template <class T>
-struct RankQuery {
-    T      lo;
-    T      hi;
-    size_t rank; // 0-indexed, relative to the elements currently inside [lo,hi]
-    bool   done;
-    T      result;
-};
-
-// Advances every unfinished query by one level in a SINGLE pass over the column. Queries whose
-// ranges are identical (which is always the case on the first level, where both quartiles span
-// [min,max]) share one histogram instead of building the same counts twice.
-template <class T>
-void AdvanceRankQueries(const T *v, size_t n, size_t nt, RankQuery<T> *q, size_t nq,
-                        std::vector<std::vector<IqrHistCount>> &scratch) {
-    using U                    = typename std::make_unsigned<T>::type;
-    constexpr size_t MAX_ACTIVE = 4;
-
-    size_t   active[MAX_ACTIVE];   // index into q[] of each unfinished query
-    size_t   hist_of[MAX_ACTIVE];  // which histogram that query reads
-    U        base[MAX_ACTIVE];
-    unsigned shift[MAX_ACTIVE];
-    size_t   nbins[MAX_ACTIVE];
-    size_t   na = 0, nh = 0;
-
-    for (size_t i = 0; i < nq && na < MAX_ACTIVE; i++) {
-        if (q[i].done) {
-            continue;
-        }
-        if (q[i].lo == q[i].hi) { // range collapsed to one value: that is the answer
-            q[i].result = q[i].lo;
-            q[i].done   = true;
-            continue;
-        }
-        const U  b     = static_cast<U>(q[i].lo);
-        const U  range = static_cast<U>(q[i].hi) - b;
-        unsigned sh    = 0;
-        while ((range >> sh) >= IQR_CPU_HIST_BINS) {
-            sh++;
-        }
-        // Share a histogram with an earlier active query covering exactly the same range.
-        size_t reuse = nh;
-        for (size_t j = 0; j < na; j++) {
-            if (q[active[j]].lo == q[i].lo && q[active[j]].hi == q[i].hi) {
-                reuse = hist_of[j];
-                break;
-            }
-        }
-        if (reuse == nh) {
-            base[nh]  = b;
-            shift[nh] = sh;
-            nbins[nh] = static_cast<size_t>(range >> sh) + 1;
-            nh++;
-        }
-        hist_of[na] = reuse;
-        active[na]  = i;
-        na++;
-    }
-    if (na == 0) {
-        return;
-    }
-
-    // Span of each histogram as an unsigned offset from its base. Hoisted out of the scan: unsigned
-    // wrap puts any out-of-range value above the span, so membership is a single compare per element.
-    U span[MAX_ACTIVE];
-    for (size_t h = 0; h < nh; h++) {
-        span[h] = ((static_cast<U>(nbins[h]) - 1) << shift[h]) | ((U(1) << shift[h]) - 1);
-    }
-
-    const size_t stride = IQR_CPU_HIST_BINS;
-    if (scratch.size() != nt) {
-        scratch.assign(nt, {});
-    }
-    ParallelRanges(n, nt, [&](size_t t, size_t lo, size_t hi) {
-        auto &sc = scratch[t];
-        if (sc.size() < stride * nh) {
-            sc.assign(stride * nh, 0);
-        } else {
-            std::fill(sc.begin(), sc.begin() + stride * nh, 0);
-        }
-        IqrHistCount *sp = sc.data();
-        if (nh == 1) {
-            // The first level always lands here (both quartiles share [min,max]). Keeping it a flat
-            // loop over scalars, with nothing indexed by a loop variable, is worth a lot to the
-            // vectorizer compared with the general path below.
-            const U        b0 = base[0], s0 = span[0];
-            const unsigned k0 = shift[0];
-            for (size_t i = lo; i < hi; i++) {
-                const U off = static_cast<U>(v[i]) - b0;
-                if (off <= s0) {
-                    sp[static_cast<size_t>(off >> k0)]++;
-                }
-            }
-            return;
-        }
-        for (size_t i = lo; i < hi; i++) {
-            const T x = v[i];
-            for (size_t h = 0; h < nh; h++) {
-                const U off = static_cast<U>(x) - base[h];
-                if (off <= span[h]) {
-                    sp[h * stride + static_cast<size_t>(off >> shift[h])]++;
-                }
-            }
-        }
-    });
-
-    for (size_t j = 0; j < na; j++) {
-        RankQuery<T> &qq = q[active[j]];
-        const size_t  h  = hist_of[j];
-
-        uint64_t cum = 0, before = 0;
-        size_t   chosen = nbins[h] - 1;
-        bool     found  = false;
-        for (size_t b = 0; b < nbins[h]; b++) {
-            uint64_t c = 0;
-            for (size_t t = 0; t < nt; t++) {
-                const auto &sc = scratch[t];
-                if (sc.size() >= stride * nh) {
-                    c += sc[h * stride + b];
-                }
-            }
-            if (cum + c > qq.rank) {
-                chosen = b;
-                before = cum;
-                found  = true;
-                break;
-            }
-            cum += c;
-        }
-        if (!found) {
-            before = cum; // rank past the end: clamp into the last bin
-        }
-        qq.rank -= static_cast<size_t>(before);
-
-        const T nlo = static_cast<T>(base[h] + (static_cast<U>(chosen) << shift[h]));
-        if (shift[h] == 0) {
-            qq.result = nlo; // one distinct value per bin -- exact
-            qq.done   = true;
-            continue;
-        }
-        T nhi = static_cast<T>(base[h] + ((static_cast<U>(chosen + 1) << shift[h]) - 1));
-        if (nhi > qq.hi) {
-            nhi = qq.hi;
-        }
-        qq.lo = nlo;
-        qq.hi = nhi;
-    }
-}
-
-// Exact order statistics k1 and k3 (both 0-indexed) by iterative histogram narrowing, with both
-// quartiles advanced in the same pass. No sort, no candidate materialization, O(N) per level and at
-// most a handful of levels (every dataset here needs two).
-template <class T>
-void SelectQuartiles(const T *v, size_t n, size_t k1, size_t k3, size_t nt, T &q1, T &q3) {
-    T vmin, vmax;
-    ParallelMinMax<T>(v, n, nt, vmin, vmax);
-    if (vmin == vmax) {
-        q1 = q3 = vmin; // constant column: every order statistic is that value
-        return;
-    }
-
-    RankQuery<T> q[2] = {{vmin, vmax, k1, false, T {}}, {vmin, vmax, k3, false, T {}}};
-    std::vector<std::vector<IqrHistCount>> scratch;
-    while (!q[0].done || !q[1].done) {
-        AdvanceRankQueries<T>(v, n, nt, q, 2, scratch);
-    }
-    q1 = q[0].result;
-    q3 = q[1].result;
-}
-
 // lo/hi for the 1.5*IQR rule. Computed in 128-bit so q3+1.5*IQR can never overflow T, then clamped
 // back into T's range -- clamping is exact here, since no value of type T can lie outside it anyway.
 template <class T>
@@ -1916,38 +1695,13 @@ size_t ReadColumnCpu(ClientContext &context, const IqrFlagsBindData &bind, size_
         const size_t expected = (gb < ngroups ? group_off[gb] : total) - group_off[ga];
         const size_t got      = static_cast<size_t>(dst - start);
         if (got != expected) {
-            throw InternalException("iqr_cpu_flags: row groups [%llu,%llu) yielded %llu values, "
+            throw InternalException("iqr_cpu_flags_groupby: row groups [%llu,%llu) yielded %llu values, "
                                     "expected %llu",
                                     (unsigned long long)ga, (unsigned long long)gb,
                                     (unsigned long long)got, (unsigned long long)expected);
         }
     });
     return total;
-}
-
-// Quartiles + fences + flags for one signedness. Returns a short description of the fences it
-// derived, so OASIS_IQR_TIMING=1 can print them next to the FPGA's for a direct comparison.
-template <class T>
-std::string IqrCpuCore(const int64_t *raw, size_t n, size_t nt, uint8_t *mask, double &quart_ms,
-                       double &flag_ms) {
-    const T *v = reinterpret_cast<const T *>(raw);
-
-    // min(v) WHERE cc*4 >= t  ==  the ceil(N/4)-th smallest, 1-indexed. Likewise 3N/4 for q3.
-    const size_t k1 = (n + 3) / 4;
-    const size_t k3 = (3 * n + 3) / 4;
-
-    T    q1, q3, lo, hi;
-    auto t0 = TimingClock::now();
-    SelectQuartiles<T>(v, n, k1 - 1, k3 - 1, nt, q1, q3);
-    IqrFences<T>(q1, q3, lo, hi);
-    quart_ms = ms_since(t0);
-
-    auto t1 = TimingClock::now();
-    ComputeFlagMask<T>(v, n, lo, hi, mask, nt);
-    flag_ms = ms_since(t1);
-
-    return "q1=" + std::to_string(q1) + " q3=" + std::to_string(q3) + " lo=" + std::to_string(lo) +
-           " hi=" + std::to_string(hi);
 }
 
 // The CPU twin of IqrFlagsGlobalState: owns plain host memory, so this operator builds and runs with
@@ -1962,75 +1716,13 @@ struct IqrCpuGlobalState : public GlobalTableFunctionState {
     }
 };
 
-void RunHeavyPhaseCpu(ClientContext &context, const IqrFlagsBindData &bind, IqrCpuGlobalState &gstate) {
-    const size_t nt    = CpuThreadCount(context);
-    auto         t_all = TimingClock::now();
-
-    CpuColumn     values;
-    auto          t_read  = TimingClock::now();
-    const size_t               n       = ReadColumnCpu(context, bind, nt, values);
-    const double               read_ms = ms_since(t_read);
-    gstate.num_elements                = n;
-    if (n == 0) {
-        return;
-    }
-
-    // ComputeFlagMask writes every byte, so this too is left uninitialized on purpose.
-    gstate.flags.reset(new uint8_t[(n + 7) / 8]);
-
-    const int64_t *vals = values.ptr;
-    double      quart_ms = 0.0, flag_ms = 0.0;
-    std::string fences =
-        bind.is_signed
-            ? IqrCpuCore<int64_t>(vals, n, nt, gstate.flags.get(), quart_ms, flag_ms)
-            : IqrCpuCore<uint64_t>(vals, n, nt, gstate.flags.get(), quart_ms, flag_ms);
-
-    // FAIRNESS: release the materialised column HERE, inside the heavy span, and time it.
-    //
-    // The CPU baseline must hold the whole column in RAM for its histogram passes; the FPGA streams
-    // and never does. Releasing it is a real, unavoidable cost of the CPU approach -- but `values`
-    // is a local whose destructor runs on RETURN, i.e. *after* the heavy timer stopped, so it used
-    // to drop out of the operator number entirely (sf10: ~61 ms to free 457 MB -- RESULTS.md 9.18).
-    // That made "operator" a near-complete number for the FPGA (its teardown is a pooled-buffer
-    // return, ~0) but a partial one for the CPU, so a head-to-head `heavy` comparison understated the
-    // CPU by up to 61 ms. `vals` is no longer read (the flags live in gstate.flags), so freeing now
-    // is safe, and folding free_ms into heavy makes "operator" mean the same span on both sides.
-    // e2e already included this cost (it is real wall-clock), so only the operator table changes.
-    //
-    // NOTE (2026-07-24, 9.28): the allocator was reverted to raw new[]/delete[], so `free` is once
-    // again a kernel unmap rather than a pool return -- expect ~20 ms on taxi_d4 and ~61 ms on sf10.
-    // It is counted inside `heavy` (unlike before Defect 3), so it is visible, not hidden.
-    auto         t_free  = TimingClock::now();
-    values.Release();
-    const double free_ms = ms_since(t_free);
-
-    if (timing_enabled()) {
-        std::fprintf(stderr,
-                     "[iqr-cpu] rows=%zu  threads=%zu  %s\n"
-                     "[iqr-cpu]   read    %8.2f ms   <- DuckDB parquet decode of the target column\n"
-                     "[iqr-cpu]   quart   %8.2f ms   <- min/max + iterative histogram zoom (exact)\n"
-                     "[iqr-cpu]   flags   %8.2f ms   <- fence compare into the packed bitmask\n"
-                     "[iqr-cpu]   free    %8.2f ms   <- release the materialised column (FPGA streams, never pays this)\n"
-                     "[iqr-cpu]   heavy   %8.2f ms   <- everything before DuckDB emits a single row\n",
-                     n, nt, fences.c_str(), read_ms, quart_ms, flag_ms, free_ms, ms_since(t_all));
-    }
-}
-
 unique_ptr<FunctionData> IqrCpuFlagsBind(ClientContext &context, TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types, vector<string> &names) {
     auto bind_data = ResolveIqrColumn(context, StringValue::Get(input.inputs[0]),
-                                      StringValue::Get(input.inputs[1]), "iqr_cpu_flags");
+                                      StringValue::Get(input.inputs[1]), "iqr_cpu_flags_groupby");
     names.emplace_back("is_outlier");
     return_types.push_back(LogicalType::BOOLEAN);
     return std::move(bind_data);
-}
-
-unique_ptr<GlobalTableFunctionState> IqrCpuFlagsInitGlobal(ClientContext &context,
-                                                           TableFunctionInitInput &input) {
-    auto &bind   = input.bind_data->Cast<IqrFlagsBindData>();
-    auto  gstate = make_uniq<IqrCpuGlobalState>();
-    RunHeavyPhaseCpu(context, bind, *gstate);
-    return std::move(gstate);
 }
 
 void IqrCpuFlagsFunction(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
@@ -2049,14 +1741,9 @@ void IqrCpuFlagsFunction(ClientContext &, TableFunctionInput &data_p, DataChunk 
 // =============================================================================================
 // iqr_cpu_flags_groupby(path, column) -- the DIRECT C++ TRANSLITERATION of the SQL baseline
 //
-// Why this exists (RESULTS.md 9.29). `iqr_cpu_flags` shares the SQL's *rule* but not its *mechanics*:
-// it resolves the quartiles with an iterative histogram zoom, which is a different algorithm that
-// happens to produce the same answer. That conflates two effects in the SQL -> C++ speedup of 9.1:
-//
-//     (a) leaving DuckDB's parser / binder / optimizer / general-purpose executor
-//     (b) replacing GROUP BY + ORDER BY with a histogram
-//
-// This function is (a) alone. It transliterates the SQL statement for statement:
+// Why this exists (RESULTS.md 9.29). It shares the SQL's mechanics as well as its rule, so the
+// SQL -> C++ speedup measures only leaving DuckDB's parser / binder / optimizer / general-purpose
+// executor, not a change of algorithm. It transliterates the SQL statement for statement:
 //
 //     ecnt AS (SELECT v, count(*) c FROM s GROUP BY v)          -> per-thread hash tables + combine
 //     ecum AS (SELECT v, sum(c) OVER (ORDER BY v) cc FROM ecnt) -> sort the DISTINCT values, scan
@@ -2064,8 +1751,8 @@ void IqrCpuFlagsFunction(ClientContext &, TableFunctionInput &data_p, DataChunk 
 //     ef   AS (q1-(d+(d>>1)), q3+(d+(d>>1)))                    -> IqrFences, unchanged
 //     SELECT (v < lo OR v > hi)                                 -> ComputeFlagMask, unchanged
 //
-// It deliberately shares ReadColumnCpu, IqrFences, ComputeFlagMask and the whole emit path with
-// iqr_cpu_flags, so a head-to-head measures the quartile computation and nothing else.
+// The column read (ReadColumnCpu) and the packed-bitmask emit path (EmitFlagSlice) are the same code
+// the FPGA operator's comparison uses, so a head-to-head measures the computation and nothing else.
 //
 // Shape note: this is a hash aggregate over N followed by a sort over D (the distinct count) -- the
 // same shape DuckDB's plan has, and NOT a sort over N (that is 6.5's approach 4, 36.8x slower).
@@ -2275,7 +1962,7 @@ std::string IqrCpuCoreGroupBy(const int64_t *raw, size_t n, size_t nt, uint8_t *
     std::vector<std::pair<T, uint64_t>>().swap(ord);
     order_ms = ms_since(t1);
 
-    // ---- the labeling pass, byte-identical to iqr_cpu_flags ------------------------------------
+    // ---- the labeling pass (ComputeFlagMask) -----------------------------------------------
     auto t2 = TimingClock::now();
     ComputeFlagMask<T>(v, n, lo, hi, mask, nt);
     flag_ms = ms_since(t2);
@@ -2308,7 +1995,7 @@ void RunHeavyPhaseCpuGroupBy(ClientContext &context, const IqrFlagsBindData &bin
                           : IqrCpuCoreGroupBy<uint64_t>(vals, n, nt, gstate.flags.get(), group_ms,
                                                         order_ms, flag_ms, n_distinct, part_ms, agg_ms);
 
-    // Same fairness rule as iqr_cpu_flags: the column release is a real cost of holding the whole
+    // Fairness rule: the column release is a real cost of holding the whole
     // column, so it is counted inside `heavy` (RESULTS.md 9.18 Defect 3).
     auto         t_free  = TimingClock::now();
     values.Release();
@@ -2452,17 +2139,11 @@ void RegisterOasisIqrFunction(ExtensionLoader &loader) {
                                  IqrFlagsInitLocal);
     loader.RegisterFunction(iqr_flags_only);
 
-    // CPU reference implementation: identical signature, schema and emit path to iqr_flags_only, so
-    //   SELECT is_outlier FROM iqr_flags_only(f,c);   -- FPGA
-    //   SELECT is_outlier FROM iqr_cpu_flags (f,c);   -- CPU
-    // differ in nothing but where the quartiles and the fence compare run.
-    TableFunction iqr_cpu_flags("iqr_cpu_flags", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-                                IqrCpuFlagsFunction, IqrCpuFlagsBind, IqrCpuFlagsInitGlobal,
-                                IqrFlagsInitLocal);
-    loader.RegisterFunction(iqr_cpu_flags);
-
-    // Direct transliteration of the SQL baseline (GROUP BY + ORDER BY) rather than the histogram
-    // zoom. Same bind, same schema, same read and emit paths as iqr_cpu_flags -- see RESULTS.md 9.29.
+    // CPU reference implementation: a direct transliteration of the SQL baseline (GROUP BY +
+    // ORDER BY), with the same signature, schema and emit path as iqr_flags_only, so
+    //   SELECT is_outlier FROM iqr_flags_only(f,c);          -- FPGA
+    //   SELECT is_outlier FROM iqr_cpu_flags_groupby(f,c);   -- CPU
+    // differ in nothing but where the quartiles and the fence compare run. See RESULTS.md 9.29.
     TableFunction iqr_cpu_flags_groupby("iqr_cpu_flags_groupby",
                                         {LogicalType::VARCHAR, LogicalType::VARCHAR},
                                         IqrCpuFlagsFunction, IqrCpuFlagsBind,
