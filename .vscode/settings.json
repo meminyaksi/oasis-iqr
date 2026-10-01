@@ -1,0 +1,45 @@
+{
+    "python.testing.unittestArgs": [
+        "-v",
+        "-s",
+        "./hardware/unit-tests",
+        "-p",
+        "*_test.py"
+    ],
+    "python.testing.pytestEnabled": false,
+    "python.testing.unittestEnabled": true,
+
+    "C_Cpp.formatting": "clangFormat",
+    "C_Cpp.clang_format_style": "file",
+
+    "cmake.sourceDirectory": [
+        "${workspaceFolder}/software"
+    ],
+
+    "makefile.makeDirectory": "${workspaceFolder}/extension",
+
+    // Pylance indexes every .py in the workspace, which here means the vendored submodules
+    // (DuckDB, Coyote, celeris) and a fresh coyote_test copy inside EVERY hardware/build-NN.
+    // None of that is edited by hand. hardware/unit-tests/ is deliberately NOT excluded --
+    // that is where the real tests live and what python.testing.unittestArgs points at.
+    "python.analysis.exclude": [
+        "**/hardware/build-*/**",
+        "**/parcore/libstf/coyote/**",
+        "**/extension/duckdb/**",
+        "**/celeris/**"
+    ],
+
+    // Do not filesystem-watch a running Vivado build directory: bitgen.log and the .runs tree
+    // churn constantly for hours, and every event wakes the editor for no benefit.
+    "files.watcherExclude": {
+        "**/hardware/build-*/**": true,
+        "**/extension/duckdb/**": true
+    },
+
+    // Keep them out of the file picker and search too, so Ctrl-P finds source rather than
+    // generated copies of it.
+    "search.exclude": {
+        "**/hardware/build-*/**": true,
+        "**/extension/duckdb/**": true
+    }
+}

@@ -1,0 +1,28 @@
+diff --git a/scripts/impl/pnr_shell.tcl.in b/scripts/impl/pnr_shell.tcl.in
+index dce46d7a..a66f3e5a 100644
+--- a/scripts/impl/pnr_shell.tcl.in
++++ b/scripts/impl/pnr_shell.tcl.in
+@@ -63,8 +63,21 @@ if {$cfg(build_opt) eq 1} {
+             place_design -directive Auto_1
+         } 
+     } else {
+-        place_design -directive Auto_1
+-    } 
++        # OASIS OVERRIDE (env OASIS_PLACE_DIRECTIVE). Vivado's ML predictor picks SSI_BalanceSLRs for
++        # this design (`Place 30-1947`), which balances the NUMBER OF CELLS between SLRs and is blind to
++        # crossing wires -- it leaves the critical path at 71% route. Forcing SSI_SpreadSLLs ("allocate
++        # extra area for regions of higher connectivity") measured -0.657 vs -0.995 on build-28, i.e.
++        # +0.338 ns for free. A sweep of all 7 valid place directives found SpreadSLLs to be a UNIQUE
++        # outlier: BalanceSLLs/SpreadLogic_high/ExtraTimingOpt all -0.997, AltSpreadLogic_high -1.019,
++        # HighUtilSLRs UNROUTABLE (14,525 unrouted signals). Without this override an HBM-out build
++        # re-measures the OLD, WRONG answer under BalanceSLRs. Unset the env var to get stock Coyote.
++        if {[info exists ::env(OASIS_PLACE_DIRECTIVE)] && $::env(OASIS_PLACE_DIRECTIVE) ne ""} {
++            puts "[color $clr_flow "** OASIS: place_design -directive $::env(OASIS_PLACE_DIRECTIVE) (overriding Auto_1)"]"
++            place_design -directive $::env(OASIS_PLACE_DIRECTIVE)
++        } else {
++            place_design -directive Auto_1
++        }
++    }
+ } else {
+     place_design
+ }
