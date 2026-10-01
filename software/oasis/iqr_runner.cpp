@@ -19,6 +19,30 @@
 
 namespace oasis {
 
+namespace {
+
+// libstf::enqueue_stream_input with a selectable source stream kind. Upstream libstf hard-codes
+// STRM_HOST; the card path needs STRM_CARD. Same chunking: ensure the TLB mapping, then issue
+// LOCAL_READs of at most MAX_TRANSFER_SIZE, with `last` only on the final chunk.
+void enqueue_stream_input(std::shared_ptr<coyote::cThread> cthread,
+                          std::shared_ptr<libstf::TLBManager> tlb_manager, const void *ptr,
+                          size_t size, libstf::stream_t stream, bool last, uint32_t strm_kind) {
+    auto byte_ptr = static_cast<const std::byte *>(ptr);
+    tlb_manager->ensure_tlb_mapping(ptr, size);
+    for (size_t off = 0; off < size; off += coyote::MAX_TRANSFER_SIZE) {
+        coyote::localSg sg;
+        sg.addr   = (void *)(byte_ptr + off);
+        sg.len    = std::min(size - off, coyote::MAX_TRANSFER_SIZE);
+        sg.stream = strm_kind;
+        sg.dest   = stream;
+
+        auto last_transfer = (off + coyote::MAX_TRANSFER_SIZE >= size) && last;
+        cthread->invoke(coyote::CoyoteOper::LOCAL_READ, sg, last_transfer);
+    }
+}
+
+} // namespace
+
 IqrRunner::IqrRunner(OasisContext &ctx, bool is_signed, bool auto_window, int64_t bin_min,
                      uint64_t bin_shift, bool use_card)
     : ctx_(ctx),
@@ -147,9 +171,9 @@ void IqrRunner::stream_pass(const std::vector<InputChunk> &inputs, uint32_t strm
     size_t last = inputs.size() - 1;
     for (size_t i = 0; i < inputs.size(); ++i) {
         bool is_last = (i == last);
-        libstf::enqueue_stream_input(ctx_.cthread(), ctx_.tlb_manager(), inputs[i].first,
-                                     inputs[i].second, static_cast<libstf::stream_t>(dest), is_last,
-                                     strm_kind);
+        enqueue_stream_input(ctx_.cthread(), ctx_.tlb_manager(), inputs[i].first,
+                             inputs[i].second, static_cast<libstf::stream_t>(dest), is_last,
+                             strm_kind);
     }
 }
 
@@ -479,9 +503,9 @@ void IqrRunner::feed_pass1(const InputChunk &chunk, bool is_last) {
     if (chunk.second == 0) {
         return;
     }
-    libstf::enqueue_stream_input(ctx_.cthread(), ctx_.tlb_manager(), chunk.first, chunk.second,
-                                 static_cast<libstf::stream_t>(ctx_.iqrStream()), is_last,
-                                 coyote::STRM_HOST);
+    enqueue_stream_input(ctx_.cthread(), ctx_.tlb_manager(), chunk.first, chunk.second,
+                         static_cast<libstf::stream_t>(ctx_.iqrStream()), is_last,
+                         coyote::STRM_HOST);
 }
 
 IqrRunner::Result IqrRunner::finish_overlapped(const std::vector<InputChunk> &inputs) {
