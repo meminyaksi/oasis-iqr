@@ -155,7 +155,7 @@ export OASIS_IQR_STREAM=1 OASIS_IQR_FUSE=1 OASIS_IQR_WINDOW_FPGA=1 OASIS_IQR_DEC
 ### Real-dataset benchmark
 `scripts/run_real.sh [DATASET_DIR]` measures the FPGA operator against the CPU baseline on the seven
 real datasets and prints one table: CPU and FPGA end-to-end time (median of 15 warm runs) and the
-speedup, with `(fused)` on the datasets that ran fused. It sets the fused configuration above itself.
+speedup. It sets the fused configuration above itself (with the default 30M threshold only sf10 fuses).
 Any dataset whose FPGA and CPU outlier counts differ by more than 1% of its rows is reported as a
 warning after the table.
 

@@ -18,8 +18,7 @@ THREADS="${THREADS:-32}"
 
 export LD_LIBRARY_PATH="$HOME/opt/lib:${LD_LIBRARY_PATH:-}"
 export OASIS_IQR_STREAM=1 OASIS_IQR_FUSE=1 OASIS_IQR_WINDOW_FPGA=1 OASIS_IQR_DECODE_WINDOW=16
-export OASIS_IQR_TIMING=1      # only used to report whether a dataset ran fused
-unset OASIS_IQR_IDX_PASS2
+unset OASIS_IQR_IDX_PASS2 OASIS_IQR_TIMING
 
 # file stem, column, row count, label in the figure
 DATASETS=(
@@ -32,17 +31,16 @@ DATASETS=(
     "tpch_extprice_sf10 v           60.0M  sf10"
 )
 
-# Runs one query 1+N times; prints "<median seconds> <outlier count> <pass1 mode>".
+# Runs one query 1+N times; prints "<median seconds> <outlier count>".
 measure() {
     local q="$1" out
     out=$( { echo "PRAGMA threads=$THREADS;"; echo ".mode list"; echo ".headers off"; echo ".timer on"
              for _ in $(seq 0 "$N"); do echo "$q"; done; } | "$DUCK" 2>&1 )
-    local med cnt mode
+    local med cnt
     med=$(echo "$out" | grep -oP 'Run Time \(s\): real \K[0-9.]+' | tail -n +2 | sort -n |
           awk '{a[NR]=$1} END {if (NR==0) print "nan"; else print (NR%2) ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2}')
     cnt=$(echo "$out" | grep -E '^[0-9]+$' | tail -1)
-    mode=$(echo "$out" | grep -oP 'pass1=\K\w+' | tail -1)
-    echo "${med:-nan} ${cnt:-nan} ${mode:--}"
+    echo "${med:-nan} ${cnt:-nan}"
 }
 
 printf "%-16s %7s %10s %10s %9s\n" "dataset" "rows" "CPU (ms)" "FPGA (ms)" "speedup"
@@ -56,10 +54,9 @@ for d in "${DATASETS[@]}"; do
     fi
     cat "$f" > /dev/null    # warm the page cache
 
-    read -r fpga_s fpga_cnt mode <<< "$(measure "SELECT count(*) FILTER (WHERE is_outlier) FROM iqr_flags_only('$f','$col');")"
-    read -r cpu_s  cpu_cnt  _    <<< "$(measure "SELECT count(*) FILTER (WHERE is_outlier) FROM iqr_cpu_flags_groupby('$f','$col');")"
+    read -r fpga_s fpga_cnt <<< "$(measure "SELECT count(*) FILTER (WHERE is_outlier) FROM iqr_flags_only('$f','$col');")"
+    read -r cpu_s  cpu_cnt  <<< "$(measure "SELECT count(*) FILTER (WHERE is_outlier) FROM iqr_cpu_flags_groupby('$f','$col');")"
 
-    [ "$mode" = "fused" ] && label="$label (fused)"
     awk -v l="$label" -v r="$rows" -v c="$cpu_s" -v g="$fpga_s" \
         'BEGIN { printf "%-16s %7s %10.1f %10.1f %8.2fx\n", l, r, c*1000, g*1000, (g>0 ? c/g : 0) }'
 
