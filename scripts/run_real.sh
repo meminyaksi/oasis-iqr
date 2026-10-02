@@ -4,7 +4,8 @@
 # Per dataset and arm: 1 warm-up + N timed runs in one DuckDB session, end-to-end query time
 # (.timer "real"), median. The query aggregates the flags (count of outliers) instead of storing them,
 # so DuckDB's single-threaded table append is not measured. CPU arm = iqr_cpu_flags_groupby (exact
-# quartiles). Speedup = CPU / FPGA.
+# quartiles). Speedup = CPU / FPGA. The operator picks its own configuration (the fused path for
+# columns with at least 30M rows, i.e. sf10), so no environment variables are needed.
 #
 # Usage:  scripts/run_real.sh [DATASET_DIR]      (default ~/datasets; N=15 by default)
 # Needs:  extension/build/release/duckdb built, FPGA programmed, 1 GiB huge pages reserved.
@@ -17,8 +18,6 @@ N="${N:-15}"
 THREADS="${THREADS:-32}"
 
 export LD_LIBRARY_PATH="$HOME/opt/lib:${LD_LIBRARY_PATH:-}"
-export OASIS_IQR_STREAM=1 OASIS_IQR_FUSE=1 OASIS_IQR_WINDOW_FPGA=1 OASIS_IQR_DECODE_WINDOW=16
-unset OASIS_IQR_IDX_PASS2 OASIS_IQR_TIMING
 
 # file stem, column, row count, label in the figure
 DATASETS=(

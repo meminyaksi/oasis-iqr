@@ -5,9 +5,10 @@
 
 namespace duckdb {
 
-// Registers the `iqr_flags(path VARCHAR, column VARCHAR)` table function: streams one 64-bit column
-// of a Parquet file through the IQR_detection vFPGA operator and returns, per row, the value and an
-// `is_outlier` flag (1.5*IQR rule, computed in hardware).
+// Registers the IQR outlier-detection table functions (1.5*IQR rule), both returning one BOOLEAN
+// `is_outlier` row per row of a 64-bit integer Parquet column:
+//   iqr_flags_only(path VARCHAR, column VARCHAR)         -- decoded and flagged on the FPGA
+//   iqr_cpu_flags_groupby(path VARCHAR, column VARCHAR)  -- CPU baseline with exact quartiles
 void RegisterOasisIqrFunction(ExtensionLoader &loader);
 
 } // namespace duckdb

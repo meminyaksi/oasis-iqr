@@ -93,7 +93,7 @@ pass. The flags come back to the host as a packed 1-bit-per-row bitmask.
 | host driver | `software/oasis/iqr_runner.*`, `software/oasis/iqr_config.hpp`, `software/oasis/bypass_receiver.*` |
 | DuckDB table functions | `extension/src/oasis_iqr.cpp` |
 | RTL testbenches | `hardware/unit-tests/run_*_tb.sh`, `hardware/unit-tests/tb_*.sv` |
-| co-simulation example | `examples/iqr_sim/` |
+| real-dataset benchmark | `scripts/run_real.sh` |
 
 ### Building the bitstream
 The IQR lane exists only in local (non-RDMA) builds. The production configuration is
@@ -138,24 +138,27 @@ cmake -S software -B software/build -DCMAKE_INSTALL_PREFIX=$HOME/opt -DCMAKE_PRE
 cmake --build software/build -j && cmake --install software/build
 cd extension && make -j && cd build/release
 export LD_LIBRARY_PATH=$HOME/opt/lib:$LD_LIBRARY_PATH
-./duckdb -c "SELECT * FROM iqr_flags('file.parquet', 'bigint_col') LIMIT 20;"
+./duckdb -c "SELECT count(*) FILTER (WHERE is_outlier) FROM iqr_flags_only('file.parquet', 'bigint_col');"
 ```
 
-Table functions: `iqr_flags(path, col)` (value + `is_outlier`), `iqr_flags_only(path, col)`,
-the CPU baseline `iqr_cpu_flags_groupby` (exact quartiles), and `iqr_profiler()` /
-`decoder_profiler()`.
+Two table functions, both taking `(path, column)` for a BIGINT/UBIGINT Parquet column and returning
+one BOOLEAN `is_outlier` row per input row:
 
-The evaluated configuration enables the fused path, where pass 1 (the histogram) runs on chip during
-decode. Fusion engages only for columns with at least `OASIS_IQR_FUSE_MIN_ROWS` rows (default 30M);
-smaller columns use the non-fused path.
-```bash
-export OASIS_IQR_STREAM=1 OASIS_IQR_FUSE=1 OASIS_IQR_WINDOW_FPGA=1 OASIS_IQR_DECODE_WINDOW=16
-```
+| function | what runs where |
+|---|---|
+| `iqr_flags_only` | decode, histogram, quartiles, fences and flags on the FPGA |
+| `iqr_cpu_flags_groupby` | CPU baseline: DuckDB's parquet reader + exact GROUP BY / ORDER BY quartiles in C++ |
+
+`iqr_flags_only` picks its path from the column's row count; there are no settings:
+- **fewer than 30M rows:** the decoded column is gathered in host memory, the histogram window is
+  derived from it, and it is streamed to the IQR core twice (histogram pass, flag pass).
+- **30M rows or more:** fused. The window is derived from 16 row groups decoded on the FPGA, then
+  pass 1 runs on chip while the column decodes, and only the flag pass crosses PCIe.
 
 ### Real-dataset benchmark
 `scripts/run_real.sh [DATASET_DIR]` measures the FPGA operator against the CPU baseline on the seven
 real datasets and prints one table: CPU and FPGA end-to-end time (median of 15 warm runs) and the
-speedup. It sets the fused configuration above itself (with the default 30M threshold only sf10 fuses).
+speedup. Only sf10 (60M rows) takes the fused path.
 Any dataset whose FPGA and CPU outlier counts differ by more than 1% of its rows is reported as a
 warning after the table.
 
