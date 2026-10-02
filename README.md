@@ -111,12 +111,21 @@ The IQR lane exists only in local (non-RDMA) builds. The production configuratio
    ./scripts/synthesize.sh --no-rdma --device u55c --decoders 4
    grep -m1 "OASIS: place_design" hardware/build-NN/bitgen.log   # confirms the directive was used
    ```
+3. Run the post-route phys_opt ladder on the routed design. The production bitstream
+   (`cyt_top_b29_po.bit`, WNS −0.518 ns) is the output of this step, not of step 2 alone. Each
+   directive is kept only if it improves setup slack without breaking hold:
+   ```bash
+   cp hardware/pnr/physopt_iterate.tcl hardware/build-NN/ && cd hardware/build-NN
+   TERM=xterm vivado -mode batch -source physopt_iterate.tcl   # writes bitstreams/cyt_top_b29_po.bit
+   ```
+   Timing does not fully close (negative WNS), so a new build places and routes differently from the
+   production one. Check its outlier counts against the CPU baseline before trusting its numbers.
 
 ### Programming the FPGA
 ```bash
 cd parcore/libstf/coyote/driver && make && cd -
 bash parcore/libstf/coyote/util/program_hacc_local.sh \
-     hardware/build-NN/bitstreams/cyt_top.bit \
+     hardware/build-NN/bitstreams/cyt_top_b29_po.bit \
      parcore/libstf/coyote/driver/build/coyote_driver.ko 1
 echo 8 | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
 ```
@@ -142,6 +151,13 @@ smaller columns use the non-fused path.
 ```bash
 export OASIS_IQR_STREAM=1 OASIS_IQR_FUSE=1 OASIS_IQR_WINDOW_FPGA=1 OASIS_IQR_DECODE_WINDOW=16
 ```
+
+### Real-dataset benchmark
+`scripts/run_real.sh [DATASET_DIR]` measures the FPGA operator against the CPU baseline on the seven
+real datasets and prints one table: CPU and FPGA end-to-end time (median of 15 warm runs) and the
+speedup, with `(fused)` on the datasets that ran fused. It sets the fused configuration above itself.
+Any dataset whose FPGA and CPU outlier counts differ by more than 1% of its rows is reported as a
+warning after the table.
 
 ### RTL testbenches
 Each script needs Vivado (`xvlog`) on `PATH` and a configured `hardware/build-*` directory (for the
