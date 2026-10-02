@@ -292,11 +292,10 @@ size_t window_groups() {
 // fuse, medians showed fusion is a wall-clock LOSS at their sizes (op 36->43 / 54->62 ms) though a
 // CPU-seconds win (~2x). It only wins latency at sf10 scale (60M, §9.19). 30M keeps taxi_d3 (13M) and
 // taxi_d4 (20M) on the latency-optimal memcpy path while sf10+ still fuses. Fusion is verified per-row
-// exact for taxi when it does engage (obstacle-1 fixed).
-// LOWERED 30M -> 6M (build-29): the 36->43 / 54->62 ms taxi loss above was measured on build-21, which
-// was synthesized with 1 decode lane instead of 4. On build-29 (4 lanes) the size sweep (micro_bench.md
-// Test 1) measures the fused/unfused break-even at 6M rows, with fusion ahead at every size above it
-// (20M: 2.32x vs 1.79x over the CPU baseline). 6M is also the threshold Tests 2-5 ran with.
+// exact for taxi when it does engage (obstacle-1 fixed) -- so a >30M taxi-shaped column fuses correctly.
+// Still 30M on 4-lane bitstreams: forcing fusion on all seven real datasets (report_2807.md §6,
+// build-24, vs §2 build-23) still loses FPGA/C++ on taxi_d3/d4 (1.40x -> 1.24x, 1.34x -> 1.30x). The
+// 6M break-even of micro_bench.md Test 1 holds for uniform data with 8-aligned row groups, not taxi.
 size_t fuse_min_rows() {
     static const size_t n = [] {
         const char *e = std::getenv("OASIS_IQR_FUSE_MIN_ROWS");
@@ -306,7 +305,7 @@ size_t fuse_min_rows() {
                 return static_cast<size_t>(v);
             }
         }
-        return static_cast<size_t>(6000000);
+        return static_cast<size_t>(30000000);
     }();
     return n;
 }
@@ -342,9 +341,9 @@ bool force_stream() {
 // alignment of each chunk in the packed stream, which the stitch assumes, holds iff consecutive stream
 // transfers are beat-aligned; confirm with the taxi 3-way correctness test before making it default).
 // DEFAULT-ON (build-21, 2026-07-27): the host-side ragged stitch (repack_ragged_flags) is proven
-// per-row exact on taxi_d3/d4 (net_diff == per_row_mismatch: 104/104 and 0/0). So a fused taxi-shaped
+// per-row exact on taxi_d3/d4 (net_diff == per_row_mismatch: 104/104 and 0/0). So a >30M taxi-shaped
 // (odd-row-group) column fuses correctly instead of falling to memcpy. Set OASIS_IQR_STREAM_RAGGED=0
-// to force the old memcpy fallback. (No effect at default settings until FUSE is enabled and rows>=6M.)
+// to force the old memcpy fallback. (No effect at default settings until FUSE is enabled and rows>30M.)
 bool stream_ragged_enabled() {
     static const bool on = [] {
         const char *e = std::getenv("OASIS_IQR_STREAM_RAGGED");

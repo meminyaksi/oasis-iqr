@@ -146,7 +146,7 @@ the CPU baseline `iqr_cpu_flags_groupby` (exact quartiles), and `iqr_profiler()`
 `decoder_profiler()`.
 
 The evaluated configuration enables the fused path, where pass 1 (the histogram) runs on chip during
-decode. Fusion engages only for columns with at least `OASIS_IQR_FUSE_MIN_ROWS` rows (default 6M);
+decode. Fusion engages only for columns with at least `OASIS_IQR_FUSE_MIN_ROWS` rows (default 30M);
 smaller columns use the non-fused path.
 ```bash
 export OASIS_IQR_STREAM=1 OASIS_IQR_FUSE=1 OASIS_IQR_WINDOW_FPGA=1 OASIS_IQR_DECODE_WINDOW=16
